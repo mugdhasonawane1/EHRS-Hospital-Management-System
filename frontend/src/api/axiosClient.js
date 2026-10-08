@@ -1,4 +1,7 @@
 import axios from 'axios';
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL ||
+  'https://ehrs-backend-iutw.onrender.com/api';
 
 const STORAGE_KEY = 'hms.auth';
 
@@ -24,7 +27,7 @@ export function setUnauthorizedHandler(fn) {
 }
 
 const axiosClient = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
+  baseURL: API_BASE_URL,
   headers: { 'Content-Type': 'application/json' },
 });
 
@@ -46,7 +49,7 @@ async function refreshAccessToken() {
   if (!session?.refreshToken) throw new Error('No refresh token');
 
   const { data } = await axios.post(
-    `${import.meta.env.VITE_API_BASE_URL || '/api'}/auth/refresh`,
+    `${API_BASE_URL}/auth/refresh`,
     { refreshToken: session.refreshToken },
     { headers: { 'Content-Type': 'application/json' } }
   );
