@@ -1,7 +1,6 @@
 import axios from 'axios';
 const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL ||
-  'https://ehrs-backend-iutw.onrender.com/api';
+  import.meta.env.VITE_API_BASE_URL || '/api';
 
 const STORAGE_KEY = 'hms.auth';
 

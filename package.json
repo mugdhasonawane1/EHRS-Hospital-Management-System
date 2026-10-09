@@ -1,0 +1,25 @@
+{
+  "name": "ehrs-hospital-management-system",
+  "version": "1.0.0",
+  "description": "A full-stack hospital management system with three role-specific portals sharing one API:\r **patients** book and pay, **doctors** run their schedule and write clinical records, and\r **administration** manages staff, departments and billing.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "concurrently \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Manaswin05/bleh.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Manaswin05/bleh/issues"
+  },
+  "homepage": "https://github.com/Manaswin05/bleh#readme",
+  "devDependencies": {
+    "concurrently": "^10.0.6"
+  }
+}
