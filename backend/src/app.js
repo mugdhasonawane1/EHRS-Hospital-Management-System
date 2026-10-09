@@ -54,7 +54,18 @@ app.use('/api/appointments', appointmentRoutes);
 app.use('/api/medical-records', medicalRecordRoutes);
 app.use('/api/billing', billingRoutes);
 
-app.use(notFoundHandler);
+app.use('/api/*', notFoundHandler);
+
+if (env.NODE_ENV === 'production') {
+  const path = require('path');
+  app.use(express.static(path.join(__dirname, '../../frontend/dist')));
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, '../../frontend/dist/index.html'));
+  });
+} else {
+  app.use(notFoundHandler);
+}
+
 app.use(errorHandler);
 
 module.exports = app;
