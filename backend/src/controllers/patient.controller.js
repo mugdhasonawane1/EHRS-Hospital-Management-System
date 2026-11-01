@@ -1,102 +1,83 @@
 'use strict';
 
-const Patient = require('../models/Patient');
-const User = require('../models/User');
-const Appointment = require('../models/Appointment');
+const { prisma } = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const { success, ApiError } = require('../utils/apiResponse');
-const { paginateQuery } = require('../utils/paginate');
+const { getPagination, buildMeta } = require('../utils/paginate');
 const rbac = require('../services/rbac.service');
-const medicalRecordService = require('../services/medicalRecord.service');
 
-/**
- * Admins see everyone. Doctors see only patients they have appointments with —
- * derived from the appointment table, not from a role check.
- */
+const patientInclude = { user: { select: { id: true, name: true, email: true, phone: true, isActive: true } } };
+
 const list = asyncHandler(async (req, res) => {
   rbac.assertCan(req.user, rbac.RESOURCES.PATIENT, rbac.ACTIONS.READ);
-
-  const filter = {};
+  const where = {};
   if (req.user.role === 'doctor') {
-    const patientIds = await Appointment.distinct('patientId', { doctorId: req.user.doctorId });
-    filter._id = { $in: patientIds };
+    const treated = await prisma.appointment.findMany({ where: { doctorId: req.user.doctorId }, select: { patientId: true }, distinct: ['patientId'] });
+    where.id = { in: treated.map((item) => item.patientId) };
   } else if (req.user.role === 'patient') {
-    filter._id = req.user.patientId;
+    where.id = req.user.patientId;
   }
-
   if (req.query.search) {
-    const users = await User.find({ role: 'patient', $or: [
-      { name: new RegExp(req.query.search, 'i') },
-      { email: new RegExp(req.query.search, 'i') },
-    ] }).select('_id').lean();
-    filter.userId = { $in: users.map((u) => u._id) };
+    where.user = { is: { OR: [
+      { name: { contains: req.query.search } },
+      { email: { contains: req.query.search } },
+    ] } };
   }
-
-  const { items, meta } = await paginateQuery(Patient, filter, {
-    query: req.query,
-    sort: { createdAt: -1 },
-    populate: [{ path: 'userId', select: 'name email phone isActive' }],
-  });
-
-  return success(res, items, { meta });
+  const { page, limit, skip } = getPagination(req.query);
+  const [items, total] = await Promise.all([
+    prisma.patient.findMany({ where, include: patientInclude, orderBy: { createdAt: 'desc' }, skip, take: limit }),
+    prisma.patient.count({ where }),
+  ]);
+  return success(res, items, { meta: buildMeta({ page, limit, total }) });
 });
 
 const getById = asyncHandler(async (req, res) => {
   rbac.assertCan(req.user, rbac.RESOURCES.PATIENT, rbac.ACTIONS.READ);
-
-  const patient = await Patient.findById(req.params.id).populate('userId', 'name email phone isActive');
+  const patient = await prisma.patient.findUnique({ where: { id: req.params.id }, include: patientInclude });
   if (!patient) throw ApiError.notFound('Patient not found');
-
-  if (req.user.role === 'patient') {
-    rbac.assertOwnership(req.user, rbac.RESOURCES.PATIENT, patient);
-  } else if (req.user.role === 'doctor') {
-    // A doctor's "ownership" of a patient is a treatment relationship.
-    await medicalRecordService.assertHasTreated(req.user.doctorId, patient._id);
+  if (req.user.role === 'patient') rbac.assertOwnership(req.user, rbac.RESOURCES.PATIENT, patient);
+  else if (req.user.role === 'doctor') {
+    const treatment = await prisma.appointment.findFirst({ where: { doctorId: req.user.doctorId, patientId: patient.id } });
+    if (!treatment) throw ApiError.forbidden('You can only access patients you have treated');
   }
-
   return success(res, patient);
 });
 
 const update = asyncHandler(async (req, res) => {
   rbac.assertCan(req.user, rbac.RESOURCES.PATIENT, rbac.ACTIONS.UPDATE);
-
-  const patient = await Patient.findById(req.params.id);
-  if (!patient) throw ApiError.notFound('Patient not found');
-  if (req.user.role !== 'admin') rbac.assertOwnership(req.user, rbac.RESOURCES.PATIENT, patient);
+  const existing = await prisma.patient.findUnique({ where: { id: req.params.id } });
+  if (!existing) throw ApiError.notFound('Patient not found');
+  if (req.user.role !== 'admin') rbac.assertOwnership(req.user, rbac.RESOURCES.PATIENT, existing);
 
   const { name, phone, ...patientFields } = req.body;
-  Object.assign(patient, patientFields);
-  await patient.save();
-
-  if (name || phone) {
-    await User.findByIdAndUpdate(patient.userId, {
-      ...(name ? { name } : {}),
-      ...(phone ? { phone } : {}),
-    });
-  }
-
-  const fresh = await Patient.findById(patient._id).populate('userId', 'name email phone');
+  await prisma.$transaction(async (tx) => {
+    if (Object.keys(patientFields).length) {
+      await tx.patient.update({ where: { id: existing.id }, data: patientFields });
+    }
+    if (name || phone) {
+      await tx.user.update({ where: { id: existing.userId }, data: { ...(name ? { name } : {}), ...(phone ? { phone } : {}) } });
+    }
+  });
+  const fresh = await prisma.patient.findUnique({ where: { id: existing.id }, include: patientInclude });
   return success(res, fresh);
 });
 
-/** The logged-in patient's own profile + a small activity summary. */
 const getMyProfile = asyncHandler(async (req, res) => {
   if (!req.user.patientId) throw ApiError.forbidden('Your account has no patient profile');
-
-  const patient = await Patient.findById(req.user.patientId).populate('userId', 'name email phone');
+  const patient = await prisma.patient.findUnique({ where: { id: req.user.patientId }, include: patientInclude });
+  if (!patient) throw ApiError.notFound('Patient profile not found');
   const [upcoming, completed] = await Promise.all([
-    Appointment.countDocuments({ patientId: patient._id, status: 'booked', dateTime: { $gte: new Date() } }),
-    Appointment.countDocuments({ patientId: patient._id, status: 'completed' }),
+    prisma.appointment.count({ where: { patientId: patient.id, status: 'BOOKED', dateTime: { gte: new Date() } } }),
+    prisma.appointment.count({ where: { patientId: patient.id, status: 'COMPLETED' } }),
   ]);
-
   return success(res, { patient, stats: { upcomingAppointments: upcoming, completedVisits: completed } });
 });
 
 const deactivate = asyncHandler(async (req, res) => {
-  const patient = await Patient.findById(req.params.id);
+  const patient = await prisma.patient.findUnique({ where: { id: req.params.id } });
   if (!patient) throw ApiError.notFound('Patient not found');
-  await User.findByIdAndUpdate(patient.userId, { isActive: false });
-  return success(res, { deactivated: true, patientId: String(patient._id) });
+  await prisma.user.update({ where: { id: patient.userId }, data: { isActive: false } });
+  return success(res, { deactivated: true, patientId: patient.id });
 });
 
 module.exports = { list, getById, update, getMyProfile, deactivate };

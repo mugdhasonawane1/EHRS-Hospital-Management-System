@@ -6,17 +6,12 @@ const { z } = require('zod');
 
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
-/**
- * Centralised env loading + validation.
- * The process refuses to boot with a broken config rather than failing later
- * at some random request with an "undefined secret" stack trace.
- */
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(5000),
   CORS_ORIGIN: z.string().default('http://localhost:5173'),
 
-  MONGO_URI: z.string().min(1, 'MONGO_URI is required'),
+  DATABASE_URL: z.string().url('DATABASE_URL must be a valid MySQL connection URL'),
 
   JWT_ACCESS_SECRET: z.string().min(16, 'JWT_ACCESS_SECRET must be at least 16 chars'),
   JWT_REFRESH_SECRET: z.string().min(16, 'JWT_REFRESH_SECRET must be at least 16 chars'),
@@ -30,23 +25,26 @@ const envSchema = z.object({
   INVOICE_DUE_DAYS: z.coerce.number().int().min(0).default(14),
 
   SEED_PASSWORD: z.string().min(6).default('Password123!'),
+  DB_CONNECTION_LIMIT: z.coerce.number().int().positive().default(5),
 });
 
 const parsed = envSchema.safeParse(process.env);
 
 if (!parsed.success) {
-  const issues = parsed.error.issues.map((i) => `  - ${i.path.join('.')}: ${i.message}`).join('\n');
-  // eslint-disable-next-line no-console
-  console.error(`\nInvalid environment configuration:\n${issues}\n\nCopy .env.example to .env and fill it in.\n`);
+  const issues = parsed.error.issues
+    .map((issue) => `  - ${issue.path.join('.')}: ${issue.message}`)
+    .join('\n');
+
+  console.error(
+    `\nInvalid environment configuration:\n${issues}\n\n` +
+    'Check backend/.env and backend/.env.example.\n'
+  );
   process.exit(1);
 }
 
 const env = parsed.data;
 
-env.corsOrigins = env.CORS_ORIGIN.split(',')
-  .map((o) => o.trim())
-  .filter(Boolean);
-
+env.corsOrigins = env.CORS_ORIGIN.split(',').map((origin) => origin.trim()).filter(Boolean);
 env.isProd = env.NODE_ENV === 'production';
 env.isTest = env.NODE_ENV === 'test';
 

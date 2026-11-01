@@ -1,217 +1,251 @@
 'use strict';
 
-const MedicalRecord = require('../models/MedicalRecord');
-const Prescription = require('../models/Prescription');
-const Appointment = require('../models/Appointment');
-const Patient = require('../models/Patient');
+const { prisma } = require('../config/db');
 const { ApiError } = require('../utils/apiResponse');
-const { paginateQuery } = require('../utils/paginate');
+const { getPagination, buildMeta } = require('../utils/paginate');
 const rbac = require('./rbac.service');
 const logger = require('../utils/logger');
 
 const { RESOURCES, ACTIONS } = rbac;
 
-/**
- * A medical record may only be created from an appointment that
- *   (a) exists, (b) belongs to the calling doctor, (c) is `completed`,
- *   (d) doesn't already have a record.
- * Enforced here — the frontend hiding the button is not a control.
- */
+const recordInclude = {
+  patient: { include: { user: { select: { id: true, name: true, email: true, phone: true } } } },
+  doctor: { include: { user: { select: { id: true, name: true } } } },
+  appointment: { select: { id: true, dateTime: true, status: true, reason: true } },
+  prescription: { include: { medicines: true } },
+};
+
+function asApiRecord(record) {
+  if (!record) return null;
+  return {
+    ...record,
+    patientId: record.patient ? { ...record.patient, userId: record.patient.user } : record.patientId,
+    doctorId: record.doctor ? { ...record.doctor, userId: record.doctor.user } : record.doctorId,
+    appointmentId: record.appointment || record.appointmentId,
+    prescriptions: record.prescription ? [record.prescription] : [],
+  };
+}
+
+function asApiPrescription(prescription) {
+  if (!prescription) return null;
+  return {
+    ...prescription,
+    medicalRecordId: prescription.medicalRecord || prescription.medicalRecordId,
+    doctorId: prescription.doctor ? { ...prescription.doctor, userId: prescription.doctor.user } : prescription.doctorId,
+    medicines: prescription.medicines || [],
+  };
+}
+
+function ownershipWhere(user) {
+  if (user.role === 'patient') return { patientId: user.patientId };
+  if (user.role === 'doctor') return { doctorId: user.doctorId };
+  return {};
+}
+
+function vitalsData(vitals) {
+  if (!vitals) return {};
+  const result = {};
+  for (const key of ['temperatureC', 'pulseBpm', 'systolic', 'diastolic', 'weightKg', 'heightCm']) {
+    if (vitals[key] !== undefined && vitals[key] !== null && vitals[key] !== '') {
+      result[key] = ['temperatureC', 'weightKg', 'heightCm'].includes(key)
+        ? Number(vitals[key]) : Number.parseInt(vitals[key], 10);
+    }
+  }
+  return result;
+}
+
+function prescriptionCreateData(prescription) {
+  return {
+    advice: prescription.advice || null,
+    medicines: {
+      create: prescription.medicines.map((medicine) => ({
+        name: medicine.name, dosage: medicine.dosage,
+        frequency: medicine.frequency || null, duration: medicine.duration,
+        instructions: medicine.instructions || null,
+      })),
+    },
+  };
+}
+
 async function createRecord(user, payload) {
   rbac.assertCan(user, RESOURCES.MEDICAL_RECORD, ACTIONS.CREATE);
   if (!user.doctorId) throw ApiError.forbidden('Your account has no doctor profile');
 
-  const appointment = await Appointment.findById(payload.appointmentId);
+  const appointment = await prisma.appointment.findUnique({ where: { id: payload.appointmentId } });
   if (!appointment) throw ApiError.notFound('Appointment not found');
-
-  if (String(appointment.doctorId) !== String(user.doctorId)) {
+  if (appointment.doctorId !== user.doctorId) {
     throw ApiError.forbidden('You can only write records for your own appointments');
   }
-  if (appointment.status !== 'completed') {
+  if (appointment.status !== 'COMPLETED') {
     throw ApiError.conflict('A medical record can only be created for a completed appointment', {
-      code: 'APPOINTMENT_NOT_COMPLETED',
-      details: { currentStatus: appointment.status },
+      code: 'APPOINTMENT_NOT_COMPLETED', details: { currentStatus: appointment.status.toLowerCase() },
     });
   }
-  if (await MedicalRecord.exists({ appointmentId: appointment._id })) {
-    throw ApiError.conflict('This appointment already has a medical record', { code: 'RECORD_EXISTS' });
-  }
+  const existing = await prisma.medicalRecord.findUnique({ where: { appointmentId: appointment.id } });
+  if (existing) throw ApiError.conflict('This appointment already has a medical record', { code: 'RECORD_EXISTS' });
 
-  const record = await MedicalRecord.create({
-    patientId: appointment.patientId,
-    doctorId: appointment.doctorId,
-    appointmentId: appointment._id,
-    diagnosis: payload.diagnosis,
-    symptoms: payload.symptoms || [],
-    notes: payload.notes,
-    vitals: payload.vitals,
-    followUpDate: payload.followUpDate,
+  const record = await prisma.$transaction(async (tx) => {
+    const created = await tx.medicalRecord.create({
+      data: {
+        patientId: appointment.patientId, doctorId: appointment.doctorId,
+        appointmentId: appointment.id, diagnosis: payload.diagnosis,
+        symptoms: payload.symptoms || [], notes: payload.notes || null,
+        ...vitalsData(payload.vitals),
+        followUpDate: payload.followUpDate ? new Date(payload.followUpDate) : null,
+      },
+    });
+    if (payload.prescription?.medicines?.length) {
+      await tx.prescription.create({
+        data: {
+          medicalRecordId: created.id, patientId: created.patientId, doctorId: created.doctorId,
+          ...prescriptionCreateData(payload.prescription),
+        },
+      });
+    }
+    return tx.medicalRecord.findUnique({ where: { id: created.id }, include: recordInclude });
   });
 
-  // Optional prescription created in the same call — one form, one request.
-  if (payload.prescription && payload.prescription.medicines?.length) {
-    await Prescription.create({
-      medicalRecordId: record._id,
-      patientId: record.patientId,
-      doctorId: record.doctorId,
-      medicines: payload.prescription.medicines,
-      advice: payload.prescription.advice,
-    });
-  }
-
-  logger.info(`Medical record ${record._id} created for appointment ${appointment._id}`);
-  return getRecordById(user, record._id);
+  logger.info(`Medical record ${record.id} created for appointment ${appointment.id}`);
+  return asApiRecord(record);
 }
 
 async function updateRecord(user, id, payload) {
   rbac.assertCan(user, RESOURCES.MEDICAL_RECORD, ACTIONS.UPDATE);
-  const record = await MedicalRecord.findById(id);
+  const record = await prisma.medicalRecord.findUnique({ where: { id } });
   if (!record) throw ApiError.notFound('Medical record not found');
   rbac.assertAccess(user, RESOURCES.MEDICAL_RECORD, ACTIONS.UPDATE, record);
 
-  const updatable = ['diagnosis', 'symptoms', 'notes', 'vitals', 'followUpDate'];
-  for (const key of updatable) {
-    if (payload[key] !== undefined) record[key] = payload[key];
+  const data = {};
+  for (const key of ['diagnosis', 'symptoms', 'notes', 'followUpDate']) {
+    if (payload[key] !== undefined) data[key] = key === 'followUpDate'
+      ? (payload[key] ? new Date(payload[key]) : null) : payload[key];
   }
-  await record.save();
-  return getRecordById(user, record._id);
+  Object.assign(data, vitalsData(payload.vitals));
+  const updated = await prisma.medicalRecord.update({
+    where: { id }, data, include: recordInclude,
+  });
+  return asApiRecord(updated);
 }
 
-/**
- * Access-control filtered retrieval.
- * The ownership filter is folded into the query, so a patient literally cannot
- * page past their own records even by guessing ids.
- */
 async function listRecords(user, query = {}) {
   rbac.assertCan(user, RESOURCES.MEDICAL_RECORD, ACTIONS.READ);
-  const filter = { ...rbac.ownershipFilter(user, RESOURCES.MEDICAL_RECORD) };
+  const { page, limit, skip } = getPagination(query);
+  const where = { ...ownershipWhere(user) };
 
   if (query.patientId) {
     if (user.role === 'patient' && String(query.patientId) !== String(user.patientId)) {
       throw ApiError.forbidden('You can only view your own medical records');
     }
-    if (user.role === 'doctor') {
-      // Doctors may query by patient, but only for patients they've treated;
-      // the doctorId filter above already narrows it, so this is belt & braces.
-      await assertHasTreated(user.doctorId, query.patientId);
-    }
-    filter.patientId = query.patientId;
+    if (user.role === 'doctor') await assertHasTreated(user.doctorId, query.patientId);
+    where.patientId = query.patientId;
   }
-  if (query.doctorId && user.role === 'admin') filter.doctorId = query.doctorId;
-  if (query.appointmentId) filter.appointmentId = query.appointmentId;
+  if (query.doctorId && user.role === 'admin') where.doctorId = query.doctorId;
+  if (query.appointmentId) where.appointmentId = query.appointmentId;
 
-  return paginateQuery(MedicalRecord, filter, {
-    query,
-    sort: { createdAt: -1 },
-    populate: [
-      { path: 'patientId', select: 'userId dob gender bloodGroup allergies', populate: { path: 'userId', select: 'name email' } },
-      { path: 'doctorId', select: 'userId specialization', populate: { path: 'userId', select: 'name' } },
-      { path: 'appointmentId', select: 'dateTime status reason' },
-      { path: 'prescriptions' },
-    ],
-  });
+  const [records, total] = await Promise.all([
+    prisma.medicalRecord.findMany({
+      where, skip, take: limit, orderBy: { createdAt: 'desc' }, include: recordInclude,
+    }),
+    prisma.medicalRecord.count({ where }),
+  ]);
+  return { items: records.map(asApiRecord), meta: buildMeta({ page, limit, total }) };
 }
 
 async function getRecordById(user, id) {
   rbac.assertCan(user, RESOURCES.MEDICAL_RECORD, ACTIONS.READ);
-  const record = await MedicalRecord.findById(id)
-    .populate({ path: 'patientId', select: 'userId dob gender bloodGroup allergies', populate: { path: 'userId', select: 'name email' } })
-    .populate({ path: 'doctorId', select: 'userId specialization', populate: { path: 'userId', select: 'name' } })
-    .populate({ path: 'appointmentId', select: 'dateTime status reason' })
-    .populate('prescriptions');
-
+  const record = await prisma.medicalRecord.findUnique({ where: { id }, include: recordInclude });
   if (!record) throw ApiError.notFound('Medical record not found');
-  // record.doctorId === req.user.doctorId, not merely "is a doctor".
   rbac.assertAccess(user, RESOURCES.MEDICAL_RECORD, ACTIONS.READ, record);
-  return record;
+  return asApiRecord(record);
 }
 
-/** GET /api/medical-records/patient/:patientId — the RBAC-filtered history view. */
 async function getPatientHistory(user, patientId, query = {}) {
   rbac.assertCan(user, RESOURCES.MEDICAL_RECORD, ACTIONS.READ);
-
-  const patient = await Patient.findById(patientId).populate('userId', 'name email phone');
+  const patient = await prisma.patient.findUnique({
+    where: { id: patientId },
+    include: { user: { select: { id: true, name: true, email: true, phone: true } } },
+  });
   if (!patient) throw ApiError.notFound('Patient not found');
-
   if (user.role === 'patient' && String(patientId) !== String(user.patientId)) {
     throw ApiError.forbidden('You can only view your own medical history');
   }
   if (user.role === 'doctor') await assertHasTreated(user.doctorId, patientId);
 
-  const filter = { patientId };
-  if (user.role === 'doctor') filter.doctorId = user.doctorId;
-
-  const { items, meta } = await paginateQuery(MedicalRecord, filter, {
-    query,
-    sort: { createdAt: -1 },
-    populate: [
-      { path: 'doctorId', select: 'userId specialization', populate: { path: 'userId', select: 'name' } },
-      { path: 'appointmentId', select: 'dateTime status reason' },
-      { path: 'prescriptions' },
-    ],
-  });
-
-  return { patient, records: items, meta };
+  const { page, limit, skip } = getPagination(query);
+  const where = { patientId, ...(user.role === 'doctor' ? { doctorId: user.doctorId } : {}) };
+  const [records, total] = await Promise.all([
+    prisma.medicalRecord.findMany({
+      where, skip, take: limit, orderBy: { createdAt: 'desc' }, include: recordInclude,
+    }),
+    prisma.medicalRecord.count({ where }),
+  ]);
+  return {
+    patient: { ...patient, userId: patient.user },
+    records: records.map(asApiRecord),
+    meta: buildMeta({ page, limit, total }),
+  };
 }
 
-/**
- * A doctor is allowed near a patient's chart only if there is an appointment
- * linking them. This is the ownership rule for the patient resource.
- */
 async function assertHasTreated(doctorId, patientId) {
-  const linked = await Appointment.exists({ doctorId, patientId });
+  const linked = await prisma.appointment.findFirst({
+    where: { doctorId, patientId },
+    select: { id: true },
+  });
   if (!linked) throw ApiError.forbidden('You have no appointment history with this patient');
   return true;
 }
 
-/* ---------------------------- prescriptions ---------------------------- */
-
 async function createPrescription(user, payload) {
   rbac.assertCan(user, RESOURCES.PRESCRIPTION, ACTIONS.CREATE);
-  const record = await MedicalRecord.findById(payload.medicalRecordId);
+  const record = await prisma.medicalRecord.findUnique({ where: { id: payload.medicalRecordId } });
   if (!record) throw ApiError.notFound('Medical record not found');
   rbac.assertAccess(user, RESOURCES.MEDICAL_RECORD, ACTIONS.UPDATE, record);
 
-  const prescription = await Prescription.create({
-    medicalRecordId: record._id,
-    patientId: record.patientId,
-    doctorId: record.doctorId,
-    medicines: payload.medicines,
-    advice: payload.advice,
+  const prescription = await prisma.prescription.create({
+    data: {
+      medicalRecordId: record.id, patientId: record.patientId, doctorId: record.doctorId,
+      ...prescriptionCreateData(payload),
+    },
+    include: {
+      medicines: true,
+      medicalRecord: { select: { id: true, diagnosis: true, createdAt: true } },
+      doctor: { include: { user: { select: { name: true } } } },
+    },
   });
-
-  logger.info(`Prescription ${prescription._id} issued on record ${record._id}`);
-  return prescription;
+  logger.info(`Prescription ${prescription.id} issued on record ${record.id}`);
+  return asApiPrescription(prescription);
 }
 
 async function listPrescriptions(user, query = {}) {
   rbac.assertCan(user, RESOURCES.PRESCRIPTION, ACTIONS.READ);
-  const filter = { ...rbac.ownershipFilter(user, RESOURCES.PRESCRIPTION) };
-  if (query.medicalRecordId) filter.medicalRecordId = query.medicalRecordId;
+  const { page, limit, skip } = getPagination(query);
+  const where = { ...ownershipWhere(user) };
+  if (query.medicalRecordId) where.medicalRecordId = query.medicalRecordId;
   if (query.patientId) {
     if (user.role === 'patient' && String(query.patientId) !== String(user.patientId)) {
       throw ApiError.forbidden('You can only view your own prescriptions');
     }
-    filter.patientId = query.patientId;
+    where.patientId = query.patientId;
   }
 
-  return paginateQuery(Prescription, filter, {
-    query,
-    sort: { issuedAt: -1 },
-    populate: [
-      { path: 'doctorId', select: 'userId specialization', populate: { path: 'userId', select: 'name' } },
-      { path: 'medicalRecordId', select: 'diagnosis createdAt' },
-    ],
-  });
+  const include = {
+    medicines: true,
+    medicalRecord: { select: { id: true, diagnosis: true, createdAt: true } },
+    doctor: { include: { user: { select: { name: true } } } },
+  };
+  const [items, total] = await Promise.all([
+    prisma.prescription.findMany({
+      where, skip, take: limit, orderBy: { issuedAt: 'desc' }, include,
+    }),
+    prisma.prescription.count({ where }),
+  ]);
+  return {
+    items: items.map(asApiPrescription),
+    meta: buildMeta({ page, limit, total }),
+  };
 }
 
 module.exports = {
-  createRecord,
-  updateRecord,
-  listRecords,
-  getRecordById,
-  getPatientHistory,
-  createPrescription,
-  listPrescriptions,
-  assertHasTreated,
+  createRecord, updateRecord, listRecords, getRecordById, getPatientHistory,
+  createPrescription, listPrescriptions, assertHasTreated,
 };

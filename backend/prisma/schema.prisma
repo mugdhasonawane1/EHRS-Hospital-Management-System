@@ -1,0 +1,307 @@
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+enum Role {
+  ADMIN   @map("admin")
+  DOCTOR  @map("doctor")
+  PATIENT @map("patient")
+}
+
+enum AppointmentStatus {
+  BOOKED    @map("booked")
+  COMPLETED @map("completed")
+  CANCELLED @map("cancelled")
+  NO_SHOW   @map("no_show")
+}
+
+enum InvoiceStatus {
+  PENDING       @map("pending")
+  PARTIALLY_PAID @map("partially_paid")
+  PAID          @map("paid")
+  VOID          @map("void")
+}
+
+enum PaymentMethod {
+  CASH      @map("cash")
+  CARD      @map("card")
+  UPI       @map("upi")
+  INSURANCE @map("insurance")
+  OTHER     @map("other")
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Char(36)
+  name         String   @db.VarChar(120)
+  email        String   @unique @db.VarChar(191)
+  passwordHash String   @db.VarChar(255)
+  role         Role
+  phone        String?  @db.VarChar(30)
+  isActive     Boolean  @default(true)
+  lastLoginAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  patient Patient?
+  doctor  Doctor?
+
+  cancelledAppointments Appointment[] @relation("AppointmentCancelledBy")
+  createdAppointments   Appointment[] @relation("AppointmentCreatedBy")
+  generatedInvoices     Invoice[]     @relation("InvoiceGeneratedBy")
+  recordedPayments      Payment[]     @relation("PaymentRecordedBy")
+}
+
+model Patient {
+  id                String   @id @default(uuid()) @db.Char(36)
+  userId            String   @unique @db.Char(36)
+  dob               DateTime?
+  gender            String   @default("undisclosed") @db.VarChar(30)
+  bloodGroup        String   @default("unknown") @db.VarChar(10)
+  address           Json?
+  emergencyContact  Json?
+  allergies         Json?
+  chronicConditions Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user          User             @relation(fields: [userId], references: [id])
+  appointments  Appointment[]
+  invoices      Invoice[]
+  medicalRecords MedicalRecord[]
+  prescriptions Prescription[]
+
+  @@index([dob])
+}
+
+model Department {
+  id              String   @id @default(uuid()) @db.Char(36)
+  name            String   @unique @db.VarChar(120)
+  slug            String   @unique @db.VarChar(191)
+  description     String?  @db.VarChar(1000)
+  location        String?  @db.VarChar(191)
+  consultationFee Decimal  @default(500) @db.Decimal(10, 2)
+  isActive        Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  doctors           Doctor[]
+  additionalDoctors DoctorDepartment[]
+  appointments      Appointment[]
+}
+
+model Doctor {
+  id                  String   @id @default(uuid()) @db.Char(36)
+  userId              String   @unique @db.Char(36)
+  specialization      String   @db.VarChar(191)
+  departmentId        String   @db.Char(36)
+  licenseNumber       String?  @db.VarChar(191)
+  experienceYears     Int      @default(0)
+  consultationFee     Decimal  @default(500) @db.Decimal(10, 2)
+  bio                 String?  @db.VarChar(2000)
+  isAcceptingPatients Boolean  @default(true)
+  maxPatientsPerSlot  Int      @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user                User                 @relation(fields: [userId], references: [id])
+  department          Department           @relation(fields: [departmentId], references: [id])
+  additionalDepartments DoctorDepartment[]
+  availabilitySlots   DoctorAvailability[]
+  appointments        Appointment[]
+  medicalRecords      MedicalRecord[]
+  prescriptions       Prescription[]
+
+  @@index([departmentId])
+}
+
+model DoctorDepartment {
+  doctorId     String @db.Char(36)
+  departmentId String @db.Char(36)
+
+  doctor     Doctor     @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  department Department @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+
+  @@id([doctorId, departmentId])
+  @@index([departmentId])
+}
+
+model DoctorAvailability {
+  id                  String   @id @default(uuid()) @db.Char(36)
+  doctorId            String   @db.Char(36)
+  dayOfWeek           Int
+  startTime           String   @db.VarChar(5)
+  endTime             String   @db.VarChar(5)
+  slotDurationMinutes Int      @default(30)
+
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([doctorId, dayOfWeek])
+}
+
+model Appointment {
+  id                 String            @id @default(uuid()) @db.Char(36)
+  patientId          String            @db.Char(36)
+  doctorId           String            @db.Char(36)
+  departmentId       String?           @db.Char(36)
+  dateTime           DateTime
+  durationMinutes    Int               @default(30)
+  status             AppointmentStatus @default(BOOKED)
+  reason             String?           @db.VarChar(500)
+  notes              String?           @db.VarChar(2000)
+  cancelledAt        DateTime?
+  cancelledBy        String?           @db.Char(36)
+  cancellationReason String?           @db.VarChar(500)
+  completedAt        DateTime?
+  createdBy          String?           @db.Char(36)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  patient    Patient     @relation(fields: [patientId], references: [id])
+  doctor     Doctor      @relation(fields: [doctorId], references: [id])
+  department Department? @relation(fields: [departmentId], references: [id])
+
+  canceller User? @relation("AppointmentCancelledBy", fields: [cancelledBy], references: [id])
+  creator   User? @relation("AppointmentCreatedBy", fields: [createdBy], references: [id])
+
+  invoice       Invoice?
+  medicalRecord MedicalRecord?
+
+  @@index([doctorId, dateTime])
+  @@index([patientId, dateTime])
+  @@index([departmentId, dateTime])
+  @@index([status])
+}
+
+model Invoice {
+  id            String        @id @default(uuid()) @db.Char(36)
+  invoiceNumber String        @unique @db.VarChar(100)
+  patientId     String        @db.Char(36)
+  appointmentId String        @unique @db.Char(36)
+  subTotal      Decimal       @default(0) @db.Decimal(10, 2)
+  discount      Decimal       @default(0) @db.Decimal(10, 2)
+  taxRate       Decimal       @default(0) @db.Decimal(5, 2)
+  tax           Decimal       @default(0) @db.Decimal(10, 2)
+  totalAmount   Decimal       @default(0) @db.Decimal(10, 2)
+  amountPaid    Decimal       @default(0) @db.Decimal(10, 2)
+  status        InvoiceStatus @default(PENDING)
+  dueDate       DateTime?
+  voidedAt      DateTime?
+  voidReason    String?       @db.VarChar(1000)
+  generatedBy   String?       @db.Char(36)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  patient     Patient     @relation(fields: [patientId], references: [id])
+  appointment Appointment @relation(fields: [appointmentId], references: [id])
+  generator   User?       @relation("InvoiceGeneratedBy", fields: [generatedBy], references: [id])
+  items       InvoiceItem[]
+  payments    Payment[]
+
+  @@index([patientId])
+  @@index([status])
+}
+
+model InvoiceItem {
+  id          String  @id @default(uuid()) @db.Char(36)
+  invoiceId   String  @db.Char(36)
+  description String  @db.VarChar(255)
+  quantity    Int     @default(1)
+  unitPrice   Decimal @db.Decimal(10, 2)
+  amount      Decimal @db.Decimal(10, 2)
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+}
+
+model Payment {
+  id         String        @id @default(uuid()) @db.Char(36)
+  invoiceId  String        @db.Char(36)
+  amount     Decimal       @db.Decimal(10, 2)
+  method     PaymentMethod @default(CASH)
+  reference  String?       @db.VarChar(191)
+  paidAt     DateTime      @default(now())
+  recordedBy String?       @db.Char(36)
+
+  invoice  Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  recorder User?   @relation("PaymentRecordedBy", fields: [recordedBy], references: [id])
+
+  @@index([invoiceId])
+  @@index([recordedBy])
+}
+
+model MedicalRecord {
+  id            String   @id @default(uuid()) @db.Char(36)
+  patientId     String   @db.Char(36)
+  doctorId      String   @db.Char(36)
+  appointmentId String   @unique @db.Char(36)
+  diagnosis     String   @db.VarChar(1000)
+  symptoms      Json?
+  notes         String?  @db.VarChar(5000)
+  temperatureC  Decimal? @db.Decimal(5, 2)
+  pulseBpm      Int?
+  systolic      Int?
+  diastolic     Int?
+  weightKg      Decimal? @db.Decimal(5, 2)
+  heightCm      Decimal? @db.Decimal(5, 2)
+  followUpDate  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  patient      Patient      @relation(fields: [patientId], references: [id])
+  doctor       Doctor       @relation(fields: [doctorId], references: [id])
+  appointment  Appointment  @relation(fields: [appointmentId], references: [id])
+  prescription Prescription?
+
+  @@index([patientId])
+  @@index([doctorId])
+}
+
+model Prescription {
+  id              String   @id @default(uuid()) @db.Char(36)
+  medicalRecordId String   @unique @db.Char(36)
+  patientId       String   @db.Char(36)
+  doctorId        String   @db.Char(36)
+  advice          String?  @db.VarChar(2000)
+  issuedAt        DateTime @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  medicalRecord MedicalRecord       @relation(fields: [medicalRecordId], references: [id])
+  patient       Patient             @relation(fields: [patientId], references: [id])
+  doctor        Doctor              @relation(fields: [doctorId], references: [id])
+  medicines     PrescriptionMedicine[]
+
+  @@index([patientId])
+  @@index([doctorId])
+}
+
+model PrescriptionMedicine {
+  id             String  @id @default(uuid()) @db.Char(36)
+  prescriptionId String  @db.Char(36)
+  name           String  @db.VarChar(191)
+  dosage         String  @db.VarChar(100)
+  frequency      String? @db.VarChar(191)
+  duration       String  @db.VarChar(100)
+  instructions   String? @db.VarChar(1000)
+
+  prescription Prescription @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+
+  @@index([prescriptionId])
+}

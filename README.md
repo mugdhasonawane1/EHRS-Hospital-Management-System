@@ -87,7 +87,8 @@ enforcement** — live in the service layer and are covered by tests, not sketch
 ### Prerequisites
 
 - **Node.js 18+** and npm
-- **MongoDB** running locally on `127.0.0.1:27017`, or a MongoDB Atlas connection string
+- **MongoDB** on `127.0.0.1:27017` — the backend starts a local `mongod` automatically
+  (data in `backend/.mongo-data/`). No Atlas connection is needed.
 
 ### 1. Backend
 
@@ -129,6 +130,9 @@ Visit **http://localhost:5173** and use the one-click demo buttons on the sign-i
 | `backend` | `npm run dev` | Start the API with nodemon |
 | `backend` | `npm start` | Start the API |
 | `backend` | `npm run seed` | Reset and populate demo data |
+| `backend` | `npm run db:start` | Start the local MongoDB (automatic on `dev`/`start`/`seed`) |
+| `backend` | `npm run db:stop` | Stop the local MongoDB |
+| `backend` | `npm run db:status` | Show whether local MongoDB is running |
 | `backend` | `npm test` | Run the unit tests |
 | `frontend` | `npm run dev` | Vite dev server on :5173 |
 | `frontend` | `npm run build` | Production build to `dist/` |

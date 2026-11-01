@@ -181,10 +181,10 @@ function ownershipFilter(user, resource) {
       if (user.role === 'patient') return { patientId: user.patientId };
       break;
     case RESOURCES.PATIENT:
-      if (user.role === 'patient') return { _id: user.patientId };
+      if (user.role === 'patient') return { id: user.patientId };
       break;
     case RESOURCES.DOCTOR:
-      if (user.role === 'doctor') return { _id: user.doctorId };
+      if (user.role === 'doctor') return { id: user.doctorId };
       break;
     default:
       break;

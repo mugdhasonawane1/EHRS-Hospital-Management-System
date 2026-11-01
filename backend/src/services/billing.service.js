@@ -1,13 +1,9 @@
 'use strict';
 
-const Invoice = require('../models/Invoice');
-const Appointment = require('../models/Appointment');
-const Doctor = require('../models/Doctor');
-const Department = require('../models/Department');
-const Patient = require('../models/Patient');
+const { prisma } = require('../config/db');
 const env = require('../config/env');
 const { ApiError } = require('../utils/apiResponse');
-const { paginateQuery } = require('../utils/paginate');
+const { getPagination, buildMeta } = require('../utils/paginate');
 const { calculateInvoice, resolvePaymentStatus, round2 } = require('../utils/invoiceCalculator');
 const { addDays } = require('../utils/formatDate');
 const rbac = require('./rbac.service');
@@ -16,51 +12,75 @@ const logger = require('../utils/logger');
 
 const { RESOURCES, ACTIONS } = rbac;
 
-/** INV-20260812-0007 — readable, sortable, unique per day. */
-async function nextInvoiceNumber(now = new Date()) {
+const invoiceInclude = {
+  patient: { include: { user: { select: { id: true, name: true, email: true, phone: true } } } },
+  appointment: { select: { id: true, dateTime: true, status: true, doctorId: true } },
+  items: true,
+  payments: true,
+};
+
+function asApiInvoice(invoice) {
+  if (!invoice) return null;
+  const plain = {
+    ...invoice,
+    subTotal: Number(invoice.subTotal),
+    discount: Number(invoice.discount),
+    taxRate: Number(invoice.taxRate),
+    tax: Number(invoice.tax),
+    totalAmount: Number(invoice.totalAmount),
+    amountPaid: Number(invoice.amountPaid),
+    balanceDue: round2(Number(invoice.totalAmount) - Number(invoice.amountPaid)),
+    items: (invoice.items || []).map((item) => ({
+      ...item, unitPrice: Number(item.unitPrice), amount: Number(item.amount),
+    })),
+    payments: (invoice.payments || []).map((payment) => ({
+      ...payment, amount: Number(payment.amount),
+    })),
+  };
+  if (invoice.patient) {
+    plain.patientId = { ...invoice.patient, userId: invoice.patient.user };
+  }
+  if (invoice.appointment) plain.appointmentId = invoice.appointment;
+  return plain;
+}
+
+async function nextInvoiceNumber(now = new Date(), tx = prisma) {
   const datePart = now.toISOString().slice(0, 10).replace(/-/g, '');
   const prefix = `INV-${datePart}-`;
-  const last = await Invoice.findOne({ invoiceNumber: new RegExp(`^${prefix}`) })
-    .sort({ invoiceNumber: -1 })
-    .select('invoiceNumber')
-    .lean();
+  const last = await tx.invoice.findFirst({
+    where: { invoiceNumber: { startsWith: prefix } },
+    orderBy: { invoiceNumber: 'desc' },
+    select: { invoiceNumber: true },
+  });
   const seq = last ? parseInt(last.invoiceNumber.slice(prefix.length), 10) + 1 : 1;
   return `${prefix}${String(seq).padStart(4, '0')}`;
 }
 
-/**
- * Invoice generation for a completed visit.
- * Line items default to the consultation fee (doctor's, falling back to the
- * department's) plus whatever extra items the caller passes.
- */
 async function generateInvoiceForAppointment(user, appointmentId, options = {}) {
-  // `system: true` is used when the appointment-completion flow generates the
-  // invoice on the doctor's behalf — doctors can't mint invoices themselves.
   if (!options.system) rbac.assertCan(user, RESOURCES.INVOICE, ACTIONS.CREATE);
 
-  const appointment = await Appointment.findById(appointmentId);
+  const appointment = await prisma.appointment.findUnique({ where: { id: appointmentId } });
   if (!appointment) throw ApiError.notFound('Appointment not found');
-
-  if (appointment.status !== 'completed') {
+  if (appointment.status !== 'COMPLETED') {
     throw ApiError.conflict('Invoices are only generated for completed appointments', {
       code: 'APPOINTMENT_NOT_COMPLETED',
       details: { currentStatus: appointment.status },
     });
   }
 
-  const existing = await Invoice.findOne({ appointmentId: appointment._id });
-  if (existing && existing.status !== 'void') {
-    // Idempotent: completing twice or a retry must not mint a second invoice.
-    return existing;
-  }
+  const existing = await prisma.invoice.findUnique({
+    where: { appointmentId }, include: invoiceInclude,
+  });
+  if (existing && existing.status !== 'VOID') return asApiInvoice(existing);
 
-  const doctor = await Doctor.findById(appointment.doctorId).lean();
-  const department = await Department.findById(appointment.departmentId || doctor?.departmentId).lean();
-
-  const consultationFee = options.consultationFee
-    ?? doctor?.consultationFee
-    ?? department?.consultationFee
-    ?? 500;
+  const doctor = await prisma.doctor.findUnique({ where: { id: appointment.doctorId } });
+  const departmentId = appointment.departmentId || doctor?.departmentId;
+  const department = departmentId
+    ? await prisma.department.findUnique({ where: { id: departmentId } })
+    : null;
+  const consultationFee = Number(
+    options.consultationFee ?? doctor?.consultationFee ?? department?.consultationFee ?? 500
+  );
 
   const rawItems = [
     {
@@ -70,214 +90,285 @@ async function generateInvoiceForAppointment(user, appointmentId, options = {}) 
     },
     ...(options.items || []),
   ];
-
   const totals = calculateInvoice(rawItems, {
     taxRate: options.taxRate ?? env.INVOICE_TAX_RATE,
     discount: options.discount ?? 0,
   });
 
-  const doc = {
-    patientId: appointment.patientId,
-    appointmentId: appointment._id,
-    ...totals,
-    amountPaid: 0,
-    status: 'pending',
-    dueDate: addDays(new Date(), env.INVOICE_DUE_DAYS),
-    generatedBy: user.id,
-  };
+  const invoiceNumber = existing?.invoiceNumber || await nextInvoiceNumber();
+  const saved = await prisma.$transaction(async (tx) => {
+    const data = {
+      patientId: appointment.patientId,
+      appointmentId,
+      subTotal: totals.subTotal,
+      discount: totals.discount || 0,
+      taxRate: totals.taxRate,
+      tax: totals.tax,
+      totalAmount: totals.totalAmount,
+      amountPaid: 0,
+      status: 'PENDING',
+      dueDate: addDays(new Date(), env.INVOICE_DUE_DAYS),
+      generatedBy: user.id,
+      voidedAt: null,
+      voidReason: null,
+    };
 
-  let invoice;
-  if (existing) {
-    // Re-issuing over a voided invoice keeps the same number.
-    Object.assign(existing, doc, { voidedAt: undefined, voidReason: undefined });
-    invoice = await existing.save();
-  } else {
-    invoice = await Invoice.create({ ...doc, invoiceNumber: await nextInvoiceNumber() });
-  }
+    let invoice;
+    if (existing) {
+      await tx.invoiceItem.deleteMany({ where: { invoiceId: existing.id } });
+      invoice = await tx.invoice.update({
+        where: { id: existing.id },
+        data: {
+          ...data,
+          items: { create: (totals.items || rawItems).map((item) => ({
+            description: item.description,
+            quantity: item.quantity || 1,
+            unitPrice: item.unitPrice,
+            amount: item.amount ?? (item.quantity || 1) * item.unitPrice,
+          })) },
+        },
+        include: invoiceInclude,
+      });
+    } else {
+      invoice = await tx.invoice.create({
+        data: {
+          ...data,
+          invoiceNumber,
+          items: { create: (totals.items || rawItems).map((item) => ({
+            description: item.description,
+            quantity: item.quantity || 1,
+            unitPrice: item.unitPrice,
+            amount: item.amount ?? (item.quantity || 1) * item.unitPrice,
+          })) },
+        },
+        include: invoiceInclude,
+      });
+    }
+    return invoice;
+  });
 
-  await notifyInvoice(invoice);
-  logger.info(`Invoice ${invoice.invoiceNumber} generated for appointment ${appointment._id} (${invoice.totalAmount})`);
-  return invoice;
+  await notifyInvoice(saved);
+  logger.info(`Invoice ${saved.invoiceNumber} generated for appointment ${appointmentId}`);
+  return asApiInvoice(saved);
 }
 
 async function listInvoices(user, query = {}) {
   rbac.assertCan(user, RESOURCES.INVOICE, ACTIONS.READ);
-  const filter = { ...rbac.ownershipFilter(user, RESOURCES.INVOICE) };
-  if (query.status) filter.status = query.status;
-  if (query.patientId && user.role === 'admin') filter.patientId = query.patientId;
+  const where = {};
+  if (user.role === 'patient') where.patientId = user.patientId;
+  if (query.status) where.status = String(query.status).toUpperCase();
+  if (query.patientId && user.role === 'admin') where.patientId = query.patientId;
 
-  return paginateQuery(Invoice, filter, {
-    query,
-    sort: { createdAt: -1 },
-    populate: [
-      { path: 'patientId', select: 'userId', populate: { path: 'userId', select: 'name email' } },
-      { path: 'appointmentId', select: 'dateTime status doctorId' },
-    ],
-  });
+  const { page, limit, skip } = getPagination(query);
+  const [rows, total] = await Promise.all([
+    prisma.invoice.findMany({
+      where, skip, take: limit, orderBy: { createdAt: 'desc' }, include: invoiceInclude,
+    }),
+    prisma.invoice.count({ where }),
+  ]);
+  return { items: rows.map(asApiInvoice), meta: buildMeta({ page, limit, total }) };
 }
 
-/** GET /api/billing/patient/:patientId */
 async function getPatientInvoices(user, patientId, query = {}) {
   rbac.assertCan(user, RESOURCES.INVOICE, ACTIONS.READ);
   if (user.role === 'patient' && String(patientId) !== String(user.patientId)) {
     throw ApiError.forbidden('You can only view your own invoices');
   }
   if (user.role === 'doctor') {
-    // Doctors see billing only for patients they've actually treated.
-    const treated = await Appointment.exists({ doctorId: user.doctorId, patientId });
+    const treated = await prisma.appointment.findFirst({
+      where: { doctorId: user.doctorId, patientId }, select: { id: true },
+    });
     if (!treated) throw ApiError.forbidden('You have no appointment history with this patient');
   }
-
-  const patient = await Patient.findById(patientId).populate('userId', 'name email');
+  const patient = await prisma.patient.findUnique({
+    where: { id: patientId },
+    include: { user: { select: { name: true, email: true, phone: true } } },
+  });
   if (!patient) throw ApiError.notFound('Patient not found');
 
-  const { items, meta } = await paginateQuery(Invoice, { patientId }, {
-    query,
-    sort: { createdAt: -1 },
-    populate: [{ path: 'appointmentId', select: 'dateTime status' }],
-  });
-
-  const summary = items.reduce(
-    (acc, inv) => {
-      if (inv.status === 'void') return acc;
-      acc.billed = round2(acc.billed + inv.totalAmount);
-      acc.paid = round2(acc.paid + inv.amountPaid);
-      acc.outstanding = round2(acc.billed - acc.paid);
-      return acc;
-    },
-    { billed: 0, paid: 0, outstanding: 0 }
-  );
-
-  return { patient, invoices: items, meta, summary };
+  const { page, limit, skip } = getPagination(query);
+  const where = { patientId };
+  const [rows, total] = await Promise.all([
+    prisma.invoice.findMany({
+      where, skip, take: limit, orderBy: { createdAt: 'desc' }, include: invoiceInclude,
+    }),
+    prisma.invoice.count({ where }),
+  ]);
+  const invoices = rows.map(asApiInvoice);
+  const summary = invoices.reduce((acc, inv) => {
+    if (inv.status === 'VOID') return acc;
+    acc.billed = round2(acc.billed + inv.totalAmount);
+    acc.paid = round2(acc.paid + inv.amountPaid);
+    acc.outstanding = round2(acc.billed - acc.paid);
+    return acc;
+  }, { billed: 0, paid: 0, outstanding: 0 });
+  return {
+    patient: { ...patient, userId: patient.user },
+    invoices,
+    meta: buildMeta({ page, limit, total }),
+    summary,
+  };
 }
 
 async function getInvoiceById(user, id) {
   rbac.assertCan(user, RESOURCES.INVOICE, ACTIONS.READ);
-  const invoice = await Invoice.findById(id)
-    .populate({ path: 'patientId', select: 'userId', populate: { path: 'userId', select: 'name email' } })
-    .populate({ path: 'appointmentId', select: 'dateTime status doctorId' });
+  const invoice = await prisma.invoice.findUnique({ where: { id }, include: invoiceInclude });
   if (!invoice) throw ApiError.notFound('Invoice not found');
 
   if (user.role === 'doctor') {
-    // Ownership for a doctor is resolved through the appointment.
-    const appt = await Appointment.findById(invoice.appointmentId).select('doctorId').lean();
-    if (!appt || String(appt.doctorId) !== String(user.doctorId)) {
+    if (invoice.appointment?.doctorId !== user.doctorId) {
       throw ApiError.forbidden('You do not have access to this invoice');
     }
-    return invoice;
-  }
-
-  rbac.assertAccess(user, RESOURCES.INVOICE, ACTIONS.READ, invoice);
-  return invoice;
-}
-
-/** Record a payment. Patients may pay their own; admins may record any. */
-async function recordPayment(user, invoiceId, { amount, method, reference }) {
-  rbac.assertCan(user, RESOURCES.INVOICE, ACTIONS.PAY);
-
-  const invoice = await Invoice.findById(invoiceId);
-  if (!invoice) throw ApiError.notFound('Invoice not found');
-  rbac.assertAccess(user, RESOURCES.INVOICE, ACTIONS.PAY, invoice);
-
-  if (invoice.status === 'void') throw ApiError.conflict('This invoice has been voided');
-  if (invoice.status === 'paid') throw ApiError.conflict('This invoice is already fully paid');
-
-  const balance = round2(invoice.totalAmount - invoice.amountPaid);
-  const payment = round2(Number(amount));
-  if (payment <= 0) throw ApiError.badRequest('Payment amount must be greater than zero');
-  if (payment > balance) {
-    throw ApiError.badRequest(`Payment exceeds the outstanding balance of ${balance}`, {
-      code: 'OVERPAYMENT',
-      details: { balance },
+  } else {
+    rbac.assertAccess(user, RESOURCES.INVOICE, ACTIONS.READ, {
+      ...invoice, _id: invoice.id,
     });
   }
-
-  invoice.payments.push({ amount: payment, method, reference, recordedBy: user.id, paidAt: new Date() });
-  invoice.amountPaid = round2(invoice.amountPaid + payment);
-  invoice.status = resolvePaymentStatus({
-    totalAmount: invoice.totalAmount,
-    amountPaid: invoice.amountPaid,
-    currentStatus: invoice.status,
-  });
-  await invoice.save();
-
-  logger.info(`Payment ${payment} recorded on ${invoice.invoiceNumber} -> ${invoice.status}`);
-  return invoice;
+  return asApiInvoice(invoice);
 }
 
-/** Admin: add/replace line items on a pending invoice and re-total it. */
-async function updateInvoiceItems(user, invoiceId, { items, discount, taxRate }) {
-  rbac.assertCan(user, RESOURCES.INVOICE, ACTIONS.UPDATE);
-  const invoice = await Invoice.findById(invoiceId);
-  if (!invoice) throw ApiError.notFound('Invoice not found');
-  if (invoice.status === 'paid' || invoice.status === 'void') {
-    throw ApiError.conflict(`A ${invoice.status} invoice cannot be edited`);
+async function recordPayment(user, invoiceId, { amount, method, reference }) {
+  rbac.assertCan(user, RESOURCES.INVOICE, ACTIONS.PAY);
+  const paymentAmount = round2(Number(amount));
+  if (!Number.isFinite(paymentAmount) || paymentAmount <= 0) {
+    throw ApiError.badRequest('Payment amount must be greater than zero');
   }
 
-  const totals = calculateInvoice(items ?? invoice.items, {
-    discount: discount ?? invoice.discount,
-    taxRate: taxRate ?? invoice.taxRate,
+  const updated = await prisma.$transaction(async (tx) => {
+    const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
+    if (!invoice) throw ApiError.notFound('Invoice not found');
+    rbac.assertAccess(user, RESOURCES.INVOICE, ACTIONS.PAY, { ...invoice, _id: invoice.id });
+    if (invoice.status === 'VOID') throw ApiError.conflict('This invoice has been voided');
+    if (invoice.status === 'PAID') throw ApiError.conflict('This invoice is already fully paid');
+
+    const balance = round2(Number(invoice.totalAmount) - Number(invoice.amountPaid));
+    if (paymentAmount > balance) {
+      throw ApiError.badRequest(`Payment exceeds the outstanding balance of ${balance}`, {
+        code: 'OVERPAYMENT', details: { balance },
+      });
+    }
+    const amountPaid = round2(Number(invoice.amountPaid) + paymentAmount);
+    const status = resolvePaymentStatus({
+      totalAmount: Number(invoice.totalAmount),
+      amountPaid,
+      currentStatus: invoice.status.toLowerCase(),
+    }).toUpperCase();
+
+    await tx.payment.create({
+      data: {
+        invoiceId,
+        amount: paymentAmount,
+        method: String(method || 'cash').toUpperCase(),
+        reference: reference || null,
+        recordedBy: user.id,
+      },
+    });
+    return tx.invoice.update({
+      where: { id: invoiceId }, data: { amountPaid, status }, include: invoiceInclude,
+    });
   });
-  Object.assign(invoice, totals);
-  invoice.status = resolvePaymentStatus({
-    totalAmount: invoice.totalAmount,
-    amountPaid: invoice.amountPaid,
-    currentStatus: invoice.status,
+  logger.info(`Payment ${paymentAmount} recorded on ${updated.invoiceNumber} -> ${updated.status}`);
+  return asApiInvoice(updated);
+}
+
+async function updateInvoiceItems(user, invoiceId, { items, discount, taxRate }) {
+  rbac.assertCan(user, RESOURCES.INVOICE, ACTIONS.UPDATE);
+  const current = await prisma.invoice.findUnique({
+    where: { id: invoiceId }, include: { items: true },
   });
-  await invoice.save();
-  return invoice;
+  if (!current) throw ApiError.notFound('Invoice not found');
+  if (current.status === 'PAID' || current.status === 'VOID') {
+    throw ApiError.conflict(`A ${current.status.toLowerCase()} invoice cannot be edited`);
+  }
+
+  const currentItems = current.items.map((item) => ({
+    description: item.description, quantity: item.quantity,
+    unitPrice: Number(item.unitPrice), amount: Number(item.amount),
+  }));
+  const totals = calculateInvoice(items ?? currentItems, {
+    discount: discount ?? Number(current.discount),
+    taxRate: taxRate ?? Number(current.taxRate),
+  });
+  const status = resolvePaymentStatus({
+    totalAmount: totals.totalAmount,
+    amountPaid: Number(current.amountPaid),
+    currentStatus: current.status.toLowerCase(),
+  }).toUpperCase();
+
+  const updated = await prisma.$transaction(async (tx) => {
+    await tx.invoiceItem.deleteMany({ where: { invoiceId } });
+    return tx.invoice.update({
+      where: { id: invoiceId },
+      data: {
+        subTotal: totals.subTotal, discount: totals.discount || 0,
+        taxRate: totals.taxRate, tax: totals.tax, totalAmount: totals.totalAmount, status,
+        items: { create: (totals.items || items || currentItems).map((item) => ({
+          description: item.description, quantity: item.quantity || 1,
+          unitPrice: item.unitPrice,
+          amount: item.amount ?? (item.quantity || 1) * item.unitPrice,
+        })) },
+      },
+      include: invoiceInclude,
+    });
+  });
+  return asApiInvoice(updated);
 }
 
 async function voidInvoice(user, invoiceId, reason) {
   rbac.assertCan(user, RESOURCES.INVOICE, ACTIONS.DELETE);
-  const invoice = await Invoice.findById(invoiceId);
+  const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
   if (!invoice) throw ApiError.notFound('Invoice not found');
-  if (invoice.amountPaid > 0) throw ApiError.conflict('An invoice with recorded payments cannot be voided');
-
-  invoice.status = 'void';
-  invoice.voidedAt = new Date();
-  invoice.voidReason = reason || 'Voided by admin';
-  await invoice.save();
-  return invoice;
+  if (Number(invoice.amountPaid) > 0) {
+    throw ApiError.conflict('An invoice with recorded payments cannot be voided');
+  }
+  const updated = await prisma.invoice.update({
+    where: { id: invoiceId },
+    data: { status: 'VOID', voidedAt: new Date(), voidReason: reason || 'Voided by admin' },
+    include: invoiceInclude,
+  });
+  return asApiInvoice(updated);
 }
 
-/** Admin dashboard numbers. */
 async function getBillingSummary(user) {
   rbac.assertCan(user, RESOURCES.INVOICE, ACTIONS.READ);
   if (user.role !== 'admin') throw ApiError.forbidden('Billing overview is admin-only');
-
-  const rows = await Invoice.aggregate([
-    { $group: { _id: '$status', count: { $sum: 1 }, total: { $sum: '$totalAmount' }, paid: { $sum: '$amountPaid' } } },
-  ]);
-
+  const rows = await prisma.invoice.groupBy({
+    by: ['status'],
+    _count: { _all: true },
+    _sum: { totalAmount: true, amountPaid: true },
+  });
   const byStatus = {};
   let totalBilled = 0;
   let totalCollected = 0;
-  for (const r of rows) {
-    byStatus[r._id] = { count: r.count, total: round2(r.total), paid: round2(r.paid) };
-    if (r._id !== 'void') {
-      totalBilled = round2(totalBilled + r.total);
-      totalCollected = round2(totalCollected + r.paid);
+  let invoiceCount = 0;
+  for (const row of rows) {
+    const total = Number(row._sum.totalAmount || 0);
+    const paid = Number(row._sum.amountPaid || 0);
+    const count = row._count._all;
+    byStatus[row.status.toLowerCase()] = { count, total: round2(total), paid: round2(paid) };
+    invoiceCount += count;
+    if (row.status !== 'VOID') {
+      totalBilled = round2(totalBilled + total);
+      totalCollected = round2(totalCollected + paid);
     }
   }
-
   return {
-    byStatus,
-    totalBilled,
-    totalCollected,
-    outstanding: round2(totalBilled - totalCollected),
-    invoiceCount: rows.reduce((s, r) => s + r.count, 0),
+    byStatus, totalBilled, totalCollected,
+    outstanding: round2(totalBilled - totalCollected), invoiceCount,
   };
 }
 
 async function notifyInvoice(invoice) {
   try {
-    const patient = await Patient.findById(invoice.patientId).populate('userId', 'name email').lean();
+    const patient = await prisma.patient.findUnique({
+      where: { id: invoice.patientId },
+      include: { user: { select: { name: true, email: true } } },
+    });
     notify.invoiceGenerated({
-      to: patient?.userId?.email || 'unknown@example.com',
-      patientName: patient?.userId?.name || 'patient',
+      to: patient?.user?.email || 'unknown@example.com',
+      patientName: patient?.user?.name || 'patient',
       invoiceNumber: invoice.invoiceNumber,
-      totalAmount: invoice.totalAmount,
+      totalAmount: Number(invoice.totalAmount),
     });
   } catch (err) {
     logger.warn(`Invoice notification failed: ${err.message}`);
@@ -285,13 +376,6 @@ async function notifyInvoice(invoice) {
 }
 
 module.exports = {
-  generateInvoiceForAppointment,
-  listInvoices,
-  getPatientInvoices,
-  getInvoiceById,
-  recordPayment,
-  updateInvoiceItems,
-  voidInvoice,
-  getBillingSummary,
-  nextInvoiceNumber,
+  generateInvoiceForAppointment, listInvoices, getPatientInvoices, getInvoiceById,
+  recordPayment, updateInvoiceItems, voidInvoice, getBillingSummary, nextInvoiceNumber,
 };

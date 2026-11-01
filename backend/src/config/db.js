@@ -1,27 +1,41 @@
 'use strict';
 
-const mongoose = require('mongoose');
+const { PrismaClient } = require('@prisma/client');
+const { PrismaMariaDb } = require('@prisma/adapter-mariadb');
 const env = require('./env');
 const logger = require('../utils/logger');
 
-mongoose.set('strictQuery', true);
+function buildAdapter() {
+  const databaseUrl = new URL(env.DATABASE_URL);
 
-async function connectDB(uri = env.MONGO_URI) {
+  return new PrismaMariaDb({
+    host: databaseUrl.hostname,
+    port: Number(databaseUrl.port || 3306),
+    user: decodeURIComponent(databaseUrl.username),
+    password: decodeURIComponent(databaseUrl.password),
+    database: decodeURIComponent(databaseUrl.pathname.replace(/^\//, '')),
+    connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 5),
+  });
+}
+
+const adapter = buildAdapter();
+const prisma = new PrismaClient({ adapter });
+
+async function connectDB() {
   try {
-    const conn = await mongoose.connect(uri, {
-      serverSelectionTimeoutMS: 10000,
-    });
-    logger.info(`MongoDB connected: ${conn.connection.host}/${conn.connection.name}`);
-    return conn;
+    await prisma.$connect();
+    await prisma.$queryRaw`SELECT 1`;
+    logger.info('MySQL connected successfully through Prisma');
+    return prisma;
   } catch (err) {
-    logger.error(`MongoDB connection failed: ${err.message}`);
+    logger.error(`MySQL connection failed: ${err.message}`);
     throw err;
   }
 }
 
 async function disconnectDB() {
-  await mongoose.disconnect();
-  logger.info('MongoDB disconnected');
+  await prisma.$disconnect();
+  logger.info('MySQL disconnected');
 }
 
-module.exports = { connectDB, disconnectDB, mongoose };
+module.exports = { connectDB, disconnectDB, prisma };

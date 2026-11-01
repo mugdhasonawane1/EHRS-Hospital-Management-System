@@ -1,47 +1,20 @@
 'use strict';
 
-const mongoose = require('mongoose');
-const User = require('../models/User');
-const Patient = require('../models/Patient');
-const Doctor = require('../models/Doctor');
-const Department = require('../models/Department');
-const { hashPassword } = require('../utils/hashPassword');
+const { prisma } = require('../config/db');
+const { hashPassword, comparePassword } = require('../utils/hashPassword');
 const { generateTokenPair, verifyRefreshToken, signAccessToken } = require('../utils/generateToken');
 const { ApiError } = require('../utils/apiResponse');
 const logger = require('../utils/logger');
 
-/**
- * Builds the JWT payload / req.user shape. Carrying patientId & doctorId means
- * ownership checks are one comparison instead of an extra round trip.
- */
-async function buildIdentity(user) {
-  const identity = {
-    sub: String(user._id),
-    id: String(user._id),
-    email: user.email,
-    name: user.name,
-    role: user.role,
-    patientId: null,
-    doctorId: null,
-  };
-
-  if (user.role === 'patient') {
-    const patient = await Patient.findOne({ userId: user._id }).select('_id').lean();
-    identity.patientId = patient ? String(patient._id) : null;
-  } else if (user.role === 'doctor') {
-    const doctor = await Doctor.findOne({ userId: user._id }).select('_id').lean();
-    identity.doctorId = doctor ? String(doctor._id) : null;
-  }
-
-  return identity;
-}
+const ROLE_TO_DB = { admin: 'ADMIN', doctor: 'DOCTOR', patient: 'PATIENT' };
+const ROLE_FROM_DB = { ADMIN: 'admin', DOCTOR: 'doctor', PATIENT: 'patient' };
 
 function publicUser(user, identity) {
   return {
-    id: String(user._id),
+    id: user.id,
     name: user.name,
     email: user.email,
-    role: user.role,
+    role: identity.role,
     phone: user.phone,
     isActive: user.isActive,
     patientId: identity.patientId,
@@ -49,188 +22,141 @@ function publicUser(user, identity) {
   };
 }
 
-/**
- * Self-service registration.
- * Only `patient` is open to the public. Doctors and admins are provisioned by
- * an admin (see registerStaff) — otherwise anyone could self-promote.
- */
+async function buildIdentity(user) {
+  const role = ROLE_FROM_DB[user.role] || String(user.role).toLowerCase();
+  const identity = {
+    sub: user.id,
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    role,
+    patientId: null,
+    doctorId: null,
+  };
+
+  if (role === 'patient') {
+    const patient = await prisma.patient.findUnique({ where: { userId: user.id }, select: { id: true } });
+    identity.patientId = patient?.id || null;
+  } else if (role === 'doctor') {
+    const doctor = await prisma.doctor.findUnique({ where: { userId: user.id }, select: { id: true } });
+    identity.doctorId = doctor?.id || null;
+  }
+  return identity;
+}
+
+function isUniqueConflict(error) {
+  return error?.code === 'P2002' || error?.code === 'ER_DUP_ENTRY';
+}
+
 async function register(payload) {
   const email = payload.email.toLowerCase().trim();
-  const existing = await User.findOne({ email }).lean();
-  if (existing) throw ApiError.conflict('An account with that email already exists');
-
-  const session = await mongoose.startSession();
-  let created;
+  const passwordHash = await hashPassword(payload.password);
   try {
-    await session.withTransaction(async () => {
-      const [user] = await User.create(
-        [{
-          name: payload.name,
-          email,
-          passwordHash: await hashPassword(payload.password),
-          role: 'patient',
-          phone: payload.phone,
-        }],
-        { session }
-      );
-
-      await Patient.create(
-        [{
-          userId: user._id,
+    const created = await prisma.$transaction(async (tx) => {
+      const user = await tx.user.create({
+        data: { name: payload.name, email, passwordHash, role: 'PATIENT', phone: payload.phone },
+      });
+      await tx.patient.create({
+        data: {
+          userId: user.id,
           dob: payload.dob,
-          gender: payload.gender,
-          bloodGroup: payload.bloodGroup,
+          gender: payload.gender || 'undisclosed',
+          bloodGroup: payload.bloodGroup || 'unknown',
           address: payload.address,
-        }],
-        { session }
-      );
-
-      created = user;
+        },
+      });
+      return user;
     });
-  } catch (err) {
-    if (isTransactionUnsupported(err)) {
-      created = await registerWithoutTransaction(payload, email);
-    } else {
-      throw err;
-    }
-  } finally {
-    await session.endSession();
+    return issueSession(created);
+  } catch (error) {
+    if (isUniqueConflict(error)) throw ApiError.conflict('An account with that email already exists');
+    throw error;
   }
-
-  return issueSession(created);
 }
 
-/** Standalone mongod has no transactions; fall back to sequential writes. */
-async function registerWithoutTransaction(payload, email) {
-  const user = await User.create({
-    name: payload.name,
-    email,
-    passwordHash: await hashPassword(payload.password),
-    role: 'patient',
-    phone: payload.phone,
-  });
-  try {
-    await Patient.create({
-      userId: user._id,
-      dob: payload.dob,
-      gender: payload.gender,
-      bloodGroup: payload.bloodGroup,
-      address: payload.address,
-    });
-  } catch (err) {
-    await User.deleteOne({ _id: user._id }); // manual compensation
-    throw err;
-  }
-  return user;
-}
-
-function isTransactionUnsupported(err) {
-  const msg = String(err?.message || '');
-  return (
-    err?.code === 20
-    || /Transaction numbers are only allowed/i.test(msg)
-    || /replica set/i.test(msg)
-    || /transactions are not supported/i.test(msg)
-  );
-}
-
-/** Admin-only creation of doctor/admin accounts (and their Doctor profile). */
 async function registerStaff(payload) {
   const email = payload.email.toLowerCase().trim();
-  if (await User.exists({ email })) throw ApiError.conflict('An account with that email already exists');
-
-  if (payload.role === 'doctor') {
-    const dept = await Department.findById(payload.departmentId).lean();
-    if (!dept) throw ApiError.badRequest('departmentId does not refer to an existing department');
-  }
-
-  const user = await User.create({
-    name: payload.name,
-    email,
-    passwordHash: await hashPassword(payload.password),
-    role: payload.role,
-    phone: payload.phone,
-  });
-
-  if (payload.role === 'doctor') {
-    try {
-      await Doctor.create({
-        userId: user._id,
-        specialization: payload.specialization,
-        departmentId: payload.departmentId,
-        licenseNumber: payload.licenseNumber,
-        experienceYears: payload.experienceYears,
-        consultationFee: payload.consultationFee,
-        availableSlots: payload.availableSlots || [],
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      const user = await tx.user.create({
+        data: { name: payload.name, email, passwordHash: await hashPassword(payload.password), role: ROLE_TO_DB[payload.role], phone: payload.phone },
       });
-    } catch (err) {
-      await User.deleteOne({ _id: user._id });
-      throw err;
-    }
-  }
 
-  const identity = await buildIdentity(user);
-  return publicUser(user, identity);
+      if (payload.role === 'doctor') {
+        const department = await tx.department.findUnique({ where: { id: payload.departmentId } });
+        if (!department) throw ApiError.badRequest('departmentId does not refer to an existing department');
+
+        const isPhysio = /physio/i.test(payload.specialization || '') || /physio/i.test(department.name || '');
+        const doctor = await tx.doctor.create({
+          data: {
+            userId: user.id,
+            specialization: payload.specialization,
+            departmentId: payload.departmentId,
+            licenseNumber: payload.licenseNumber,
+            experienceYears: payload.experienceYears ?? 0,
+            consultationFee: payload.consultationFee ?? 500,
+            maxPatientsPerSlot: isPhysio ? 4 : 1,
+            availabilitySlots: payload.availableSlots?.length ? { create: payload.availableSlots.map((slot) => ({
+              dayOfWeek: slot.dayOfWeek,
+              startTime: slot.startTime,
+              endTime: slot.endTime,
+              slotDurationMinutes: slot.slotDurationMinutes || 30,
+            })) } : undefined,
+          },
+        });
+        return { user, doctorId: doctor.id };
+      }
+      return { user, doctorId: null };
+    });
+    const identity = await buildIdentity(result.user);
+    return publicUser(result.user, identity);
+  } catch (error) {
+    if (isUniqueConflict(error)) throw ApiError.conflict('An account with that email already exists');
+    throw error;
+  }
 }
 
 async function login({ email, password }) {
-  const user = await User.findOne({ email: email.toLowerCase().trim() }).select('+passwordHash');
-  // Same message either way so the endpoint isn't a user-enumeration oracle.
-  if (!user) throw ApiError.unauthorized('Invalid email or password');
-
-  const ok = await user.verifyPassword(password);
-  if (!ok) throw ApiError.unauthorized('Invalid email or password');
+  const user = await prisma.user.findUnique({ where: { email: email.toLowerCase().trim() } });
+  if (!user || !(await comparePassword(password, user.passwordHash))) {
+    throw ApiError.unauthorized('Invalid email or password');
+  }
   if (!user.isActive) throw ApiError.forbidden('This account has been deactivated');
 
-  user.lastLoginAt = new Date();
-  await user.save();
-  logger.info(`Login: ${user.email} (${user.role})`);
-
-  return issueSession(user);
+  const updated = await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
+  logger.info(`Login: ${updated.email} (${ROLE_FROM_DB[updated.role] || updated.role})`);
+  return issueSession(updated);
 }
 
 async function issueSession(user) {
   const identity = await buildIdentity(user);
-  const tokens = generateTokenPair(identity);
-  return { user: publicUser(user, identity), ...tokens };
+  return { user: publicUser(user, identity), ...generateTokenPair(identity) };
 }
 
-/** Exchange a refresh token for a fresh access token (identity re-read from DB). */
 async function refresh(refreshToken) {
   const decoded = verifyRefreshToken(refreshToken);
-  const user = await User.findById(decoded.sub);
+  const user = await prisma.user.findUnique({ where: { id: decoded.sub } });
   if (!user) throw ApiError.unauthorized('Account no longer exists');
   if (!user.isActive) throw ApiError.forbidden('This account has been deactivated');
-
   const identity = await buildIdentity(user);
   return { accessToken: signAccessToken(identity), user: publicUser(user, identity) };
 }
 
 async function getMe(userId) {
-  const user = await User.findById(userId);
+  const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user) throw ApiError.notFound('User not found');
   const identity = await buildIdentity(user);
   return publicUser(user, identity);
 }
 
 async function changePassword(userId, { currentPassword, newPassword }) {
-  const user = await User.findById(userId).select('+passwordHash');
+  const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user) throw ApiError.notFound('User not found');
-  if (!(await user.verifyPassword(currentPassword))) {
+  if (!(await comparePassword(currentPassword, user.passwordHash))) {
     throw ApiError.unauthorized('Current password is incorrect');
   }
-  user.passwordHash = await hashPassword(newPassword);
-  await user.save();
+  await prisma.user.update({ where: { id: userId }, data: { passwordHash: await hashPassword(newPassword) } });
   return { changed: true };
 }
 
-module.exports = {
-  register,
-  registerStaff,
-  login,
-  refresh,
-  getMe,
-  changePassword,
-  buildIdentity,
-  publicUser,
-};
+module.exports = { register, registerStaff, login, refresh, getMe, changePassword, buildIdentity, publicUser };
